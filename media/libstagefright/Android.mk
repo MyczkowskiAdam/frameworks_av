@@ -63,6 +63,7 @@ LOCAL_SRC_FILES:=                         \
         WVMExtractor.cpp                  \
         XINGSeeker.cpp                    \
         avc_utils.cpp                     \
+        FFMPEGSoftCodec.cpp               \
 
 LOCAL_C_INCLUDES:= \
         $(TOP)/frameworks/av/include/media/ \
@@ -134,6 +135,8 @@ ifeq ($(TARGET_ENABLE_AV_EXPERIMENTS),true)
 LOCAL_CFLAGS += -DENABLE_STAGEFRIGHT_EXPERIMENTS
 endif
 
+LOCAL_C_INCLUDES += $(TOP)/hardware/qcom/media/mm-core/inc
+
 ifeq ($(call is-vendor-board-platform,QCOM),true)
 ifeq ($(strip $(AUDIO_FEATURE_ENABLED_EXTN_FLAC_DECODER)),true)
 LOCAL_CFLAGS += -DQTI_FLAC_DECODER
@@ -143,6 +146,10 @@ endif
 LOCAL_CLANG := true
 LOCAL_SANITIZE := unsigned-integer-overflow signed-integer-overflow
 
+# FFMPEG plugin
+LOCAL_C_INCLUDES += $(TOP)/external/stagefright-plugins/include
+
+LOCAL_CFLAGS += -DLOG_NDEBUG=0
 LOCAL_MODULE:= libstagefright
 
 LOCAL_MODULE_TAGS := optional
