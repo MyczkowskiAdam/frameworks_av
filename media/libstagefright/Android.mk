@@ -146,6 +146,10 @@ LOCAL_SHARED_LIBRARIES += \
         libdl \
         libRScpp \
 
+ifeq ($(TARGET_HAS_LEGACY_CAMERA_HAL1),true)
+LOCAL_CFLAGS += -DCAMCORDER_GRALLOC_SOURCE
+endif
+
 LOCAL_CFLAGS += -Wno-multichar -Werror -Wno-error=deprecated-declarations -Wall
 
 LOCAL_C_INCLUDES += $(TOP)/hardware/qcom/media/mm-core/inc
