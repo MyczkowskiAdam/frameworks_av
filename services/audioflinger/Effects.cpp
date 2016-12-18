@@ -13,6 +13,25 @@
 ** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 ** See the License for the specific language governing permissions and
 ** limitations under the License.
+**
+** This file was modified by Dolby Laboratories, Inc. The portions of the
+** code that are surrounded by "DOLBY..." are copyrighted and
+** licensed separately, as follows:
+**
+**  (C) 2011-2016 Dolby Laboratories, Inc.
+**
+** Licensed under the Apache License, Version 2.0 (the "License");
+** you may not use this file except in compliance with the License.
+** You may obtain a copy of the License at
+**
+**    http://www.apache.org/licenses/LICENSE-2.0
+**
+** Unless required by applicable law or agreed to in writing, software
+** distributed under the License is distributed on an "AS IS" BASIS,
+** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+** See the License for the specific language governing permissions and
+** limitations under the License.
+**
 */
 
 
@@ -216,9 +235,10 @@ size_t AudioFlinger::EffectModule::disconnect(EffectHandle *handle, bool unpinIf
     return mHandles.size();
 }
 
-void AudioFlinger::EffectModule::updateState() {
+bool AudioFlinger::EffectModule::updateState() {
     Mutex::Autolock _l(mLock);
 
+    bool started = false;
     switch (mState) {
     case RESTART:
         reset_l();
@@ -233,6 +253,7 @@ void AudioFlinger::EffectModule::updateState() {
         }
         if (start_l() == NO_ERROR) {
             mState = ACTIVE;
+            started = true;
         } else {
             mState = IDLE;
         }
@@ -256,6 +277,8 @@ void AudioFlinger::EffectModule::updateState() {
     default: //IDLE , ACTIVE, DESTROYED
         break;
     }
+
+    return started;
 }
 
 void AudioFlinger::EffectModule::process()
@@ -275,12 +298,29 @@ void AudioFlinger::EffectModule::process()
                                         mConfig.inputCfg.buffer.s32,
                                         mConfig.inputCfg.buffer.frameCount/2);
         }
+        int ret;
+        if (isProcessImplemented()) {
+            // do the actual processing in the effect engine
+            ret = (*mEffectInterface)->process(mEffectInterface,
+                                                   &mConfig.inputCfg.buffer,
+                                                   &mConfig.outputCfg.buffer);
+        } else {
+            if (mConfig.inputCfg.buffer.raw != mConfig.outputCfg.buffer.raw) {
+                size_t frameCnt = mConfig.inputCfg.buffer.frameCount * FCC_2;  //always stereo here
+                int16_t *in = mConfig.inputCfg.buffer.s16;
+                int16_t *out = mConfig.outputCfg.buffer.s16;
 
-        // do the actual processing in the effect engine
-        int ret = (*mEffectInterface)->process(mEffectInterface,
-                                               &mConfig.inputCfg.buffer,
-                                               &mConfig.outputCfg.buffer);
-
+                if (mConfig.outputCfg.accessMode == EFFECT_BUFFER_ACCESS_ACCUMULATE) {
+                    for (size_t i = 0; i < frameCnt; i++) {
+                        out[i] = clamp16((int32_t)out[i] + (int32_t)in[i]);
+                    }
+                } else {
+                    memcpy(mConfig.outputCfg.buffer.raw, mConfig.inputCfg.buffer.raw,
+                           frameCnt * sizeof(int16_t));
+                }
+            }
+            ret = -ENODATA;
+        }
         // force transition to IDLE state when engine is ready
         if (mState == STOPPED && ret == -ENODATA) {
             mDisableWaitCnt = 1;
@@ -297,7 +337,7 @@ void AudioFlinger::EffectModule::process()
         // accumulate input onto output
         sp<EffectChain> chain = mChain.promote();
         if (chain != 0 && chain->activeTrackCnt() != 0) {
-            size_t frameCnt = mConfig.inputCfg.buffer.frameCount * 2;  //always stereo here
+            size_t frameCnt = mConfig.inputCfg.buffer.frameCount * FCC_2;  //always stereo here
             int16_t *in = mConfig.inputCfg.buffer.s16;
             int16_t *out = mConfig.outputCfg.buffer.s16;
             for (size_t i = 0; i < frameCnt; i++) {
@@ -462,10 +502,22 @@ void AudioFlinger::EffectModule::addEffectToHal_l()
     }
 }
 
+// start() must be called with PlaybackThread::mLock or EffectChain::mLock held
 status_t AudioFlinger::EffectModule::start()
 {
-    Mutex::Autolock _l(mLock);
-    return start_l();
+    sp<EffectChain> chain;
+    status_t status;
+    {
+        Mutex::Autolock _l(mLock);
+        status = start_l();
+        if (status == NO_ERROR) {
+            chain = mChain.promote();
+        }
+    }
+    if (chain != 0) {
+        chain->resetVolume_l();
+    }
+    return status;
 }
 
 status_t AudioFlinger::EffectModule::start_l()
@@ -489,10 +541,6 @@ status_t AudioFlinger::EffectModule::start_l()
     }
     if (status == 0) {
         addEffectToHal_l();
-        sp<EffectChain> chain = mChain.promote();
-        if (chain != 0) {
-            chain->forceVolume();
-        }
     }
     return status;
 }
@@ -798,6 +846,9 @@ status_t AudioFlinger::EffectModule::setAudioSource(audio_source_t source)
 
 void AudioFlinger::EffectModule::setSuspended(bool suspended)
 {
+#ifdef DOLBY_ENABLE
+    EffectDapController::instance()->effectSuspended(this, suspended);
+#endif // DOLBY_END
     Mutex::Autolock _l(mLock);
     mSuspended = suspended;
 }
@@ -1375,7 +1426,7 @@ AudioFlinger::EffectChain::EffectChain(ThreadBase *thread,
                                         audio_session_t sessionId)
     : mThread(thread), mSessionId(sessionId), mActiveTrackCnt(0), mTrackCnt(0), mTailBufferCount(0),
       mOwnInBuffer(false), mVolumeCtrlIdx(-1), mLeftVolume(UINT_MAX), mRightVolume(UINT_MAX),
-      mNewLeftVolume(UINT_MAX), mNewRightVolume(UINT_MAX), mForceVolume(false)
+      mNewLeftVolume(UINT_MAX), mNewRightVolume(UINT_MAX)
 {
     mStrategy = AudioSystem::getStrategyForStream(AUDIO_STREAM_MUSIC);
     if (thread == NULL) {
@@ -1499,8 +1550,12 @@ void AudioFlinger::EffectChain::process_l()
             mEffects[i]->process();
         }
     }
+    bool doResetVolume = false;
     for (size_t i = 0; i < size; i++) {
-        mEffects[i]->updateState();
+        doResetVolume = mEffects[i]->updateState() || doResetVolume;
+    }
+    if (doResetVolume) {
+        resetVolume_l();
     }
 }
 
@@ -1616,8 +1671,12 @@ status_t AudioFlinger::EffectChain::addEffect_l(const sp<EffectModule>& effect)
         ALOGV("addEffect_l() effect %p, added in chain %p at rank %zu", effect.get(), this,
                 idx_insert);
     }
+#ifdef DOLBY_ENABLE
+    return effect->configure();
+#else // DOLBY_END
     effect->configure();
     return NO_ERROR;
+#endif // LINE_ADDED_BY_DOLBY
 }
 
 // removeEffect_l() must be called with PlaybackThread::mLock held
@@ -1647,6 +1706,11 @@ size_t AudioFlinger::EffectChain::removeEffect_l(const sp<EffectModule>& effect)
             mEffects.removeAt(i);
             ALOGV("removeEffect_l() effect %p, removed from chain %p at rank %zu", effect.get(),
                     this, i);
+#ifdef DOLBY_ENABLE
+            if (effect->suspended() && EffectDapController::instance()->isDapEffect(effect)) {
+                effect->setSuspended(false);
+            }
+#endif // DOLBY_END
             break;
         }
     }
@@ -1681,8 +1745,8 @@ void AudioFlinger::EffectChain::setAudioSource_l(audio_source_t source)
     }
 }
 
-// setVolume_l() must be called with PlaybackThread::mLock held
-bool AudioFlinger::EffectChain::setVolume_l(uint32_t *left, uint32_t *right)
+// setVolume_l() must be called with PlaybackThread::mLock or EffectChain::mLock held
+bool AudioFlinger::EffectChain::setVolume_l(uint32_t *left, uint32_t *right, bool force)
 {
     uint32_t newLeft = *left;
     uint32_t newRight = *right;
@@ -1700,7 +1764,7 @@ bool AudioFlinger::EffectChain::setVolume_l(uint32_t *left, uint32_t *right)
         }
     }
 
-    if (!isVolumeForced() && ctrlIdx == mVolumeCtrlIdx &&
+    if (!force && ctrlIdx == mVolumeCtrlIdx &&
             *left == mLeftVolume && *right == mRightVolume) {
         if (hasControl) {
             *left = mNewLeftVolume;
@@ -1740,6 +1804,16 @@ bool AudioFlinger::EffectChain::setVolume_l(uint32_t *left, uint32_t *right)
     *right = newRight;
 
     return hasControl;
+}
+
+// resetVolume_l() must be called with PlaybackThread::mLock or EffectChain::mLock held
+void AudioFlinger::EffectChain::resetVolume_l()
+{
+    if ((mLeftVolume != UINT_MAX) && (mRightVolume != UINT_MAX)) {
+        uint32_t left = mLeftVolume;
+        uint32_t right = mRightVolume;
+        (void)setVolume_l(&left, &right, true);
+    }
 }
 
 void AudioFlinger::EffectChain::syncHalEffectsState()
@@ -1992,6 +2066,63 @@ void AudioFlinger::EffectChain::setThread(const sp<ThreadBase>& thread)
     for (size_t i = 0; i < mEffects.size(); i++) {
         mEffects[i]->setThread(thread);
     }
+}
+
+void AudioFlinger::EffectChain::checkOutputFlagCompatibility(audio_output_flags_t *flags) const
+{
+    if ((*flags & AUDIO_OUTPUT_FLAG_RAW) != 0 && !isRawCompatible()) {
+        *flags = (audio_output_flags_t)(*flags & ~AUDIO_OUTPUT_FLAG_RAW);
+    }
+    if ((*flags & AUDIO_OUTPUT_FLAG_FAST) != 0 && !isFastCompatible()) {
+        *flags = (audio_output_flags_t)(*flags & ~AUDIO_OUTPUT_FLAG_FAST);
+    }
+}
+
+void AudioFlinger::EffectChain::checkInputFlagCompatibility(audio_input_flags_t *flags) const
+{
+    if ((*flags & AUDIO_INPUT_FLAG_RAW) != 0 && !isRawCompatible()) {
+        *flags = (audio_input_flags_t)(*flags & ~AUDIO_INPUT_FLAG_RAW);
+    }
+    if ((*flags & AUDIO_INPUT_FLAG_FAST) != 0 && !isFastCompatible()) {
+        *flags = (audio_input_flags_t)(*flags & ~AUDIO_INPUT_FLAG_FAST);
+    }
+}
+
+bool AudioFlinger::EffectChain::isRawCompatible() const
+{
+    Mutex::Autolock _l(mLock);
+    for (const auto &effect : mEffects) {
+        if (effect->isProcessImplemented()) {
+            return false;
+        }
+    }
+    // Allow effects without processing.
+    return true;
+}
+
+bool AudioFlinger::EffectChain::isFastCompatible() const
+{
+    Mutex::Autolock _l(mLock);
+    for (const auto &effect : mEffects) {
+        if (effect->isProcessImplemented()
+                && effect->isImplementationSoftware()) {
+            return false;
+        }
+    }
+    // Allow effects without processing or hw accelerated effects.
+    return true;
+}
+
+// isCompatibleWithThread_l() must be called with thread->mLock held
+bool AudioFlinger::EffectChain::isCompatibleWithThread_l(const sp<ThreadBase>& thread) const
+{
+    Mutex::Autolock _l(mLock);
+    for (size_t i = 0; i < mEffects.size(); i++) {
+        if (thread->checkEffectCompatibility_l(&(mEffects[i]->desc()), mSessionId) != NO_ERROR) {
+            return false;
+        }
+    }
+    return true;
 }
 
 } // namespace android
